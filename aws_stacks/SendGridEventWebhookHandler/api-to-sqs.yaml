@@ -1,0 +1,62 @@
+openapi: "3.0.1"
+info:
+  title: "SendGrid Event Webhook API Endpoint -- passes requests to SQS Queue."
+  version: "2021-03-31 17:32:29UTC"
+paths:
+  ############################################
+  # Path has no query string parameters
+  ############################################
+  /twilio-sendgrid:
+    post:
+      responses:
+        default:
+          description: "Response for POST /"
+      x-amazon-apigateway-integration:
+        type: "aws_proxy"
+        integrationSubtype: "SQS-SendMessage"
+        credentials:
+          Fn::GetAtt: [SGEventWebhookToSQSApiRole, Arn]
+        connectionType: "INTERNET"
+        payloadFormatVersion: "1.0"
+        requestParameters:
+          MessageBody: "$request.body"
+          ############################################
+          # Pull our the headers from SendGrid and
+          # the IP address for downstream processing.
+          # If you want to add in Basic Authentication
+          # to this API, you would include the 
+          # authorization header in the section below
+          #  {
+          #    "authorization": {
+          #      "DataType": "String",
+          #      "StringValue": "${request.header.authorization}"
+          #  },
+          # ...and then evaluate it in the 
+          # handle-sqs-messages lambda function
+          ############################################
+          MessageAttributes: >-
+            {
+              "x-twilio-email-event-webhook-signature": {
+                "DataType": "String",
+                "StringValue": "${request.header.x-twilio-email-event-webhook-signature}"
+              },
+              "x-twilio-email-event-webhook-timestamp": {
+                "DataType": "String",
+                "StringValue": "${request.header.x-twilio-email-event-webhook-timestamp}"
+              },              
+              "sourceIp": {
+                "DataType": "String",
+                "StringValue": "${context.identity.sourceIp}"
+              }                                                                                     
+            }          
+          QueueUrl:
+            Ref: SGEventWebhookQueue
+
+x-amazon-apigateway-cors:
+  allowMethods:
+  - "*"
+  maxAge: 0
+  allowCredentials: false
+  allowOrigins:
+  - "*"
+x-amazon-apigateway-importexport-version: "1.0"

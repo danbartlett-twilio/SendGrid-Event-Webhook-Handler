@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SaveSendGridEventWebhookToS3
+
+  Creates an S3 bucket, and lambda subscribed to SNS topic to receive messages and then write them to S3 bucket.
+  
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+
+  ##########################################################################
+  #  S3 Bucket
+  #                          
+  #  Bucket to store all event webhooks.
+  ########################################################################## 
+  SendGridEventWebhookBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "twilio-sendgrid-event-webhook-${AWS::AccountId}-${AWS::Region}"  
+  SendGridEventWebhookBucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SendGridEventWebhookBucket
+                - /*     
+
+  ##########################################################################
+  #  Policy
+  #                          
+  #  Provide permission for SNS to invoke the Lambda function
+  ########################################################################## 
+  SNStoTwilioSendGridWriteToS3FunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref TwilioSendGridWriteToS3Function
+      Principal: sns.amazonaws.com
+
+  ##########################################################################
+  #  Lambda Function                            
+  #                          
+  #  This function receives messages from SNS topic and writes json
+  #  file to S3 bucket.
+  ##########################################################################
+  TwilioSendGridWriteToS3Function:
+    Type: AWS::Serverless::Function
+    Properties:      
+      Description: Lambda invoked by SNS topics, writes to S3
+      CodeUri: lambdas/save-to-s3/
+      Handler: app.lambdaHandler
+      AutoPublishAlias: live
+      Runtime: nodejs18.x
+      Architectures:
+        - arm64
+      Role: !GetAtt TwilioSendGridWriteToS3FunctionRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Environment:
+        Variables:
+          REGION: !Ref "AWS::Region"
+          DestinationBucket: !Sub "twilio-sendgrid-event-webhook-${AWS::AccountId}-${AWS::Region}"
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !ImportValue 'SGEventWebhookTopicARN'
+
+  ##########################################################################
+  #  Role for Lambda Function                            
+  #                          
+  #  Allow lambda function to write to S3 bucket.
+  ##########################################################################
+  TwilioSendGridWriteToS3FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole    
+      ManagedPolicyArns:        
+        - !Ref SendGridEventWebhookBucketPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole

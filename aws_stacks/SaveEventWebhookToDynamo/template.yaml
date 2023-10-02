@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SaveStatusCallbackToDynamo
+
+  Creates DynamoDB Table and lambda function invoked by SNS topic to write items to dynamo.
+  
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+
+  ##########################################################################
+  #  DynamoDB Table
+  #                          
+  #  A simple nosql database to store event webhooks from sendgrid
+  ########################################################################## 
+  SendGridEventWebhookDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "SendGridEventWebhookDynamoDBTable-${AWS::AccountId}"
+      BillingMode: 'PAY_PER_REQUEST'
+      AttributeDefinitions:
+        -
+          AttributeName: "pk"
+          AttributeType: "S"
+        -
+          AttributeName: "sk"
+          AttributeType: "S"    
+                 
+      KeySchema:
+        -
+          AttributeName: "pk"
+          KeyType: "HASH"
+        -
+          AttributeName: "sk"
+          KeyType: "RANGE"
+
+  SendGridEventWebhookDynamoDBTablePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - "dynamodb:PutItem"
+              - "dynamodb:UpdateItem"
+            Resource:             
+              - !GetAtt SendGridEventWebhookDynamoDBTable.Arn
+
+  ##########################################################################
+  #  Policy
+  #                          
+  #  Provide permission for SNS to invoke the Lambda function
+  ########################################################################## 
+  SNStoTwilioSendGridPutToDynamoFunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref TwilioSendGridPutToDynamoFunction
+      Principal: sns.amazonaws.com
+
+  ##########################################################################
+  #  Lambda Function                            
+  #                          
+  #  This function receives messages (email events) from SNS topic and 
+  #  writes new items to DynamoDB table.
+  ##########################################################################
+  TwilioSendGridPutToDynamoFunction:
+    Type: AWS::Serverless::Function
+    Properties:      
+      Description: Lambda invoked by SNS topics, writes to DynamoDB
+      CodeUri: lambdas/save-to-dynamodb/
+      Handler: app.lambdaHandler
+      AutoPublishAlias: live
+      Runtime: nodejs18.x
+      Architectures:
+        - arm64
+      Role: !GetAtt TwilioSendGridPutToDynamoFunctionRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Environment:
+        Variables:
+          REGION: !Ref "AWS::Region"
+          TABLE_NAME: !Sub "SendGridEventWebhookDynamoDBTable-${AWS::AccountId}"
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:            
+            Topic: !ImportValue 'SGEventWebhookTopicARN'
+
+  ##########################################################################
+  #  Role for Lambda Function                            
+  #                          
+  #  Allow lambda function to write to DynamoDB.
+  ##########################################################################
+  TwilioSendGridPutToDynamoFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole    
+      ManagedPolicyArns:        
+        - !Ref SendGridEventWebhookDynamoDBTablePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole

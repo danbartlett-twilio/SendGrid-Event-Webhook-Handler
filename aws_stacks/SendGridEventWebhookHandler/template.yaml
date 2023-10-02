@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: This stack contains two options for using API Gateway to handle Event Webhooks from SendGrid.
+
+Parameters:
+  RawEventsBucketName:
+    Type: String
+  QueueName:
+    Type: String
+
+Resources:
+
+  ##########################################################################
+  #  SQS Queue                 
+  #
+  #  This queue holds for processing and POST requests sent from Twilio.
+  #  The queue handles spikey traffic so that the downstream functions are
+  #  not overrun by spikey traffic.
+  ##########################################################################
+  SGEventWebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+  SGEventWebhookQueuePolicy:
+    Type: "AWS::SQS::QueuePolicy"
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Id: QueuePolicy
+        Statement:
+          - Sid: Allow-SendMessage-To-Queue-From-S3-Event-Notification
+            Effect: Allow
+            Principal: 
+              Service: "s3.amazonaws.com"
+            Action:
+              - "sqs:SendMessage"
+            Resource: !GetAtt SGEventWebhookQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Join ["",['arn:aws:s3:::',!Ref RawEventsBucketName]]
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Queues: 
+        - !Ref SGEventWebhookQueue
+
+  ##########################################################################
+  #  S3 Bucket
+  #                          
+  #  Bucket to store all raw event webhooks. This bucket is used for the
+  #  API => S3 => SQS flow.
+  ########################################################################## 
+  SendGridRawEventBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - SGEventWebhookQueuePolicy
+    Properties:      
+      BucketName: !Ref RawEventsBucketName
+      ##########################################################
+      # This configuraiton sets up hook so that any object
+      # created in this bucket triggers an event on the attached
+      # SQS queue. This is used for the API => S3 => SQS flow.
+      ##########################################################
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt SGEventWebhookQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: '.json'      
+  SendGridRawEventBucketPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref SendGridRawEventBucket
+                - /*    
+
+  ##########################################################################
+  #  SNS Topic                 
+  #
+  #  SQS Messages passing security check get sent to SNS Topic to fan out
+  #  for additional processing by any topic subscribers. This is how events
+  #  get sent out to event consumers.
+  ##########################################################################
+  SGEventWebhookTopic:
+    Type: AWS::SNS::Topic
+
+  ##########################################################################
+  #  Lambda Layers
+  #                          
+  #  Key code snippets separated in Lambda layers to simplify code and
+  #  allow for reuse.
+  ##########################################################################
+  ValidateSendGridSignatureLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: ValidateSendGridSignature
+      Description: Function to Validate X-Twilio-Email-Event-Webhook-Signature
+      ContentUri: layers/validate-sendgrid-signature/
+      CompatibleRuntimes:
+        - nodejs18.x
+      LicenseInfo: 'MIT'
+      RetentionPolicy: Retain
+  SendGridWebhookValidationLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: SendGridWebhookValidationLayer
+      Description: Twilio SendGrid Node Library used to validate event webhooks.
+      ContentUri: layers/layer-sendgrid-eventwebhook/
+      CompatibleRuntimes:
+        - nodejs18.x
+      LicenseInfo: 'MIT'
+      RetentionPolicy: Retain  
+
+  ##########################################################################
+  #  SGEventWebhookToS3Api
+  #
+  #  HTTP API: API => S3 => SQS
+  #
+  #  This api receives POST containing SendGrid Events and sends them to the
+  #  S3 bucket.  
+  #  
+  #  This event processing flow uses API Gateway to accept posts from
+  #  SendGrid and, after checking BASIC AUTHENTICATION, PUTS the object
+  #  directly into an S3 bucket. The createObject event in S3 triggers
+  #  a message into the SQS queue.
+  ##########################################################################
+  SGEventWebhookToS3Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Path /sendgrid-events accepts POST calls to save payload to S3 bucket.
+      AccessLogSettings:
+        DestinationArn: !GetAtt SGEventWebhookToS3ApiLogs.Arn
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","routeKey":"$context.routeKey", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+      StageVariables:
+        AUTH_LEVEL: 'PRIVATE'
+  
+  ##########################################################################
+  #  Lambda Function: SendGridEventToS3Function                            
+  #                          
+  #  This function is invoked by the "SGEventWebhookToS3Api" API GATEWAY 
+  #  and it opens the request, pulls out the authorization header and verifies
+  #  it, and, if matches, puts the payload and headers into the S3 bucket.
+  ##########################################################################
+  SendGridEventToS3Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Invoked by API GW, checks Basic Auth, PUTS event payload into S3 object.
+      CodeUri: lambdas/event-to-s3/
+      AutoPublishAlias: live
+      Handler: app.lambdaHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - arm64      
+      Timeout: 10
+      MemorySize: 128      
+      Environment:
+        Variables:          
+          RAW_EVENT_BUCKET: !Ref RawEventsBucketName
+          ###############################################
+          # This lambda function checks the authorization
+          # header passed in with the request. It uses
+          # basic auth set in the SendGrid EVENT WEBHOOKD
+          # endpoint.
+          # https://parseUser:pass123@your-api-gateway-url
+          # The USER and PASSWORD entered here MUST match
+          # the values you put in the EVENT WEBHOOK 
+          # Webhook URL in SendGrid!
+          ###############################################
+          # Set test USER and PASSWORDS like below for POC
+          # SIMPLE SAMPLE USER/PASSWORD BELOW
+          # DO NOT STORE VALUES LIKE THIS IN CODE!           
+          EVENT_WEBHOOK_USER: "eventWHUser"          
+          EVENT_WEBHOOK_PASSWORD: "pass123"          
+          # Use a secure method for production such as 
+          # pulling from the AWS Parameter Store or Secrets Manager.
+          # For example:
+          # EVENT_WEBHOOK_USER: "<YOUR-EVENT_WEBHOOK_USER>"          
+          # EVENT_WEBHOOK_PASSWORD: "<YOUR-EVENT_WEBHOOK_PASSWORD>"           
+      Role: !GetAtt SendGridEventToS3FunctionRole.Arn
+      Events:
+        PostSendGridEvent:
+          Type: HttpApi
+          Properties:
+            Path: /sendgrid-events
+            Method: post
+            ApiId: !Ref SGEventWebhookToS3Api
+  SendGridEventToS3FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SendGridRawEventBucketPolicy
+        - arn:aws:iam::aws:policy/AWSLambdaExecute  
+
+  ##########################################################################
+  #  SGEventWebhookToSQSApi
+  #
+  #  HTTP API: API => SQS                                                        
+  #
+  #  This api receives POST Status Callback requests from Twilio and
+  #  sends them directly to an SQS queue to be processed.
+  #  
+  #  This event processing flow uses API Gateway to accept posts from
+  #  SendGrid and post a new message (payload and headers) directly into
+  #  the SQS queue.
+  ##########################################################################
+  SGEventWebhookToSQSApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Path /twilio-sendgrid accepts POST calls to save payload directly to SQS Queue.
+      AccessLogSettings:
+        DestinationArn: !GetAtt SGEventWebhookToSQSApiLogs.Arn
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","routeKey":"$context.routeKey", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+      # This points to a separate yaml file!
+      DefinitionBody:
+        'Fn::Transform':
+          Name: 'AWS::Include'
+          Parameters:
+            Location: 'api-to-sqs.yaml'
+      StageVariables:
+        AUTH_LEVEL: 'PRIVATE'
+
+  ##########################################################################
+  #  Lambda Function: SGEventWebhookQueueLambdaFunction                            
+  #                          
+  #  This function pulls messages from SQS queue, checks the x-twilio-sig
+  #  and, if matches, publishes each SendGrid event individually to 
+  #  the SNS topic. 
+  #  
+  #  This function is used by both SGEventWebhookToSQSApi and 
+  #  SGEventWebhookToS3Api
+  ##########################################################################
+  SGEventWebhookQueueLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:      
+      Description: Pulls messages from the SQS and processes events to publish to the SNS topic.
+      CodeUri: lambdas/handle-sqs-messages/
+      Handler: app.lambdaHandler
+      AutoPublishAlias: live
+      Runtime: nodejs18.x
+      Architectures:
+        - arm64
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:          
+          SNStopic: !Ref SGEventWebhookTopic          
+          REGION: !Ref "AWS::Region"
+          # The SENDGRID_WEBHOOK_PUBLIC_KEY is needed to validate
+          # that the request is coming from Twilio SendGrid! This
+          # value is created when creating the webhook in SendGrid.
+          # Set the SENDGRID_WEBHOOK_PUBLIC_KEY value for testing/POC 
+          # DO NOT STORE VALUES LIKE THIS IN CODE!...                                        
+          SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_S3: "<YOUR-SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_S3>"
+          SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_SQS: "SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_SQS"
+          # Use a secure method for production such as 
+          # pulling from the AWS Parameter Store or Secrets Manager.
+          # For example:
+          # SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_S3: '{{resolve:ssm:SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_S3}}'
+          # SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_SQS: '{{resolve:ssm:SENDGRID_WEBHOOK_PUBLIC_KEY_API_TO_SQS}}' 
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html         
+      Layers:
+        - !Ref SendGridWebhookValidationLayer
+        - !Ref ValidateSendGridSignatureLayer
+      Events:
+        SGEventWebhookQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SGEventWebhookQueue.Arn
+            BatchSize: 1
+            # OPTIONALLY control MaximumConcurrency to limit number
+            # of lambdas that can process messages from the SQS queue.
+            # In the event of a spike in event activity, you may not
+            # want to scale but instead let events build up in the queue
+            # and process them at a measured rate.
+            # Default setting to 2
+            # https://aws.amazon.com/blogs/compute/introducing-maximum-concurrency-of-aws-lambda-functions-when-using-amazon-sqs-as-an-event-source/
+            ScalingConfig:
+              MaximumConcurrency: 2            
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt SGEventWebhookTopic.TopicName
+        - S3ReadPolicy:
+            BucketName: !Ref SendGridRawEventBucket                        
+
+  ##########################################################################
+  # Roles
+  # 
+  # Role allows api gateway (used in api.yaml) to post messages directly
+  # to SQS queue.
+  ##########################################################################
+  SGEventWebhookToS3ApiRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: EventWebhookPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogGroup'
+                - 'logs:CreateLogStream'
+                - 'logs:DescribeLogGroups'
+                - 'logs:DescribeLogStreams'
+                - 'logs:PutLogEvents'
+                - 'logs:GetLogEvents'
+                - 'logs:FilterLogEvents'
+              Resource: !GetAtt SGEventWebhookToS3ApiLogs.Arn
+  SGEventWebhookToSQSApiRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: AllowSqsIntegration
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'sqs:SendMessage'
+                - 'sqs:GetQueueUrl'
+                - 'sqs:SendMessageBatch'
+              Resource: !GetAtt SGEventWebhookQueue.Arn
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogGroup'
+                - 'logs:CreateLogStream'
+                - 'logs:DescribeLogGroups'
+                - 'logs:DescribeLogStreams'
+                - 'logs:PutLogEvents'
+                - 'logs:GetLogEvents'
+                - 'logs:FilterLogEvents'
+              Resource: !GetAtt SGEventWebhookToSQSApiLogs.Arn                            
+
+  ##########################################################################
+  #   Cloudwatch Logs                                                       
+  ##########################################################################
+  SGEventWebhookToS3ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: SGEventWebhookToS3Api-Access-Logs
+      RetentionInDays: 1
+  SGEventWebhookToSQSApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: SGEventWebhookToSQSApi-Access-Logs
+      RetentionInDays: 1      
+
+##########################################################################
+#   Outputs
+##########################################################################
+Outputs:
+  SGEventWebhookToS3Api:
+    Description: "HTTP API endpoint for API => S3 => SQS event handling flow."
+    Value: !Sub "https://${SGEventWebhookToS3Api}.execute-api.${AWS::Region}.amazonaws.com"
+
+  SGEventWebhookToSQSApi:
+    Description: "HTTP API endpoint for API => SQS event handling flow."    
+    Value: !Sub "https://${SGEventWebhookToSQSApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  SGEventWebhookQueueLambdaFunction:
+    Description: SGEventWebhookQueueLambdaFunction function name
+    Value: !Ref SGEventWebhookQueueLambdaFunction
+
+  SGEventWebhookQueue:
+    Description: SQS queue ARN
+    Value: !GetAtt SGEventWebhookQueue.Arn
+
+  QueueName:
+    Value: !Ref QueueName
+    Description: SQS Queue
+
+  SGEventWebhookQueueURL:
+    Description: SQS queue URL
+    Value: !Ref SGEventWebhookQueue
+
+  SGEventWebhookTopic:
+    Description: SNS topic name
+    Value: !GetAtt SGEventWebhookTopic.TopicName
+    Export:
+      Name: 'SGEventWebhookTopic'
+
+  SGEventWebhookTopicARN:
+    Description: SNS topic ARN
+    Value: !Ref SGEventWebhookTopic    
+    Export:
+      Name: 'SGEventWebhookTopicARN'    

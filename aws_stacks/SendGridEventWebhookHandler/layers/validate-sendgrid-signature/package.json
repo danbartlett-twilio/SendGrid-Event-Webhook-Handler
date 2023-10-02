@@ -1,0 +1,13 @@
+{
+    "name": "validate-sendgrid-signature",
+    "version": "1.0.0",
+    "description": "",
+    "main": "validate-sendgrid-signature.mjs",
+    "type": "module",
+    "scripts": {
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "author": "",
+    "license": "ISC"
+  }
+  
