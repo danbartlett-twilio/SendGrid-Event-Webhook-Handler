@@ -36,7 +36,7 @@ export const lambdaHandler = async (event, context) => {
 
         let now = new Date(); 
         let y = now.getFullYear().toString();
-        let m = (now.getMonth() < 10 ? '0' : '') + now.getMonth().toString();
+        let m = (now.getMonth() < 9 ? '0' : '') + (now.getMonth()+1).toString();
         let d = (now.getDate() < 10 ? '0' : '') + now.getDate().toString();
         // Create a date prefix so that objects in S3 bucket are organized
         // by date. Note, date is based on UTC time!
