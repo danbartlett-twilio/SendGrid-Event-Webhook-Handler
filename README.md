@@ -1,6 +1,3 @@
 ## Microservice Template for Handling SendGrid Event Webhooks
 
-Blog coming soon!
-
-[Video Overview]([https://link-url-here.org](https://youtu.be/9NSkwQAdSps)https://youtu.be/9NSkwQAdSps)
-
+## [Read the Twilio blog that goes with this repo: Microservice for Handling SendGrid Event Webhooks ]( https://www.twilio.com/en-us/blog/microservice-template-handle-sendgrid-event-webhooks) 
